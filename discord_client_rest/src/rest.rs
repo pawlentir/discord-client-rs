@@ -34,6 +34,7 @@ use crate::bootstrap::{DEFAULT_API_VERSION, bootstrap_client, build_bot_client};
 use crate::captcha::{CaptchaRequiredError, SolvedCaptcha};
 use crate::mfa::{MfaRequiredError, MfaVerificationRequest};
 use crate::rate_limit::{RateLimitError, RateLimiter};
+pub use crate::response::DiscordApiError;
 use crate::response::{parse_error_body, rate_limit_from_body};
 use crate::structs::context::{Context, ContextHeader};
 use crate::structs::referer::{
@@ -722,9 +723,8 @@ impl RestClient {
                 return Err("Bad request".into());
             }
             code => {
-                let body = resp.text().await?;
-                let msg = format!("Request to {} failed with code {}: {}", url, code, body);
-                return Err(msg.into());
+                let bytes = resp.bytes().await?;
+                return Err(Box::new(DiscordApiError::from_body(code, url, &bytes)));
             }
         }
 

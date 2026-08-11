@@ -3,7 +3,7 @@ use crate::api::sessionless::invite::SessionlessInviteRest;
 use crate::bootstrap::{DEFAULT_API_VERSION, build_emulated_client, solve_cloudflare_clearance};
 use crate::captcha::CaptchaRequiredError;
 use crate::rate_limit::{RateLimitError, RateLimiter};
-use crate::response::{parse_error_body, rate_limit_from_body};
+use crate::response::{DiscordApiError, parse_error_body, rate_limit_from_body};
 use crate::rest::RequestProperties;
 use crate::structs::context::ContextHeader;
 use crate::structs::referer::RefererHeader;
@@ -257,9 +257,8 @@ impl SessionlessClient {
                 return Err("Bad request".into());
             }
             code => {
-                let body = resp.text().await?;
-                let msg = format!("Request to {} failed with code {}: {}", url, code, body);
-                return Err(msg.into());
+                let bytes = resp.bytes().await?;
+                return Err(Box::new(DiscordApiError::from_body(code, url, &bytes)));
             }
         }
 
