@@ -1,9 +1,8 @@
 use crate::api::sessionless::experiments::SessionlessExperimentsRest;
 use crate::api::sessionless::invite::SessionlessInviteRest;
 use crate::bootstrap::{DEFAULT_API_VERSION, build_emulated_client, solve_cloudflare_clearance};
-use crate::captcha::CaptchaRequiredError;
 use crate::rate_limit::{RateLimitError, RateLimiter};
-use crate::response::{DiscordApiError, parse_error_body, rate_limit_from_body};
+use crate::response::{DiscordApiError, bad_request_error, rate_limit_from_body};
 use crate::rest::RequestProperties;
 use crate::structs::context::ContextHeader;
 use crate::structs::referer::RefererHeader;
@@ -13,7 +12,7 @@ use current_locale::current_locale;
 use discord_client_structs::structs::client::{BuildNumbers, ClientSession};
 use discord_client_utils::find_build_numbers;
 use iana_time_zone::get_timezone;
-use log::{error, warn};
+use log::warn;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
@@ -245,16 +244,7 @@ impl SessionlessClient {
             }
             400 => {
                 let bytes = resp.bytes().await?;
-                let resp_json = parse_error_body(&bytes, status.as_u16(), url)?;
-
-                if resp_json["captcha_sitekey"].is_string() {
-                    let captcha = serde_json::from_value::<CaptchaRequiredError>(resp_json)
-                        .map_err(|e| Box::new(e) as BoxedError)?;
-                    return Err(Box::new(captcha));
-                }
-
-                error!("Bad request to {}: {}", url, resp_json.to_string());
-                return Err("Bad request".into());
+                return Err(bad_request_error(&bytes, url));
             }
             code => {
                 let bytes = resp.bytes().await?;

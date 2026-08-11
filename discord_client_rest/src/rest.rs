@@ -31,11 +31,11 @@ use crate::api::user::UserRest;
 use crate::api::voice::VoiceRest;
 use crate::api::webhook::WebhookRest;
 use crate::bootstrap::{DEFAULT_API_VERSION, bootstrap_client, build_bot_client};
-use crate::captcha::{CaptchaRequiredError, SolvedCaptcha};
+use crate::captcha::SolvedCaptcha;
 use crate::mfa::{MfaRequiredError, MfaVerificationRequest};
 use crate::rate_limit::{RateLimitError, RateLimiter};
 pub use crate::response::DiscordApiError;
-use crate::response::{parse_error_body, rate_limit_from_body};
+use crate::response::{bad_request_error, parse_error_body, rate_limit_from_body};
 use crate::structs::context::{Context, ContextHeader};
 use crate::structs::referer::{
     DmChannelReferer, GuildChannelReferer, GuildReferer, HomePageReferer, Referer, RefererHeader,
@@ -711,16 +711,7 @@ impl RestClient {
             }
             400 => {
                 let bytes = resp.bytes().await?;
-                let resp_json = parse_error_body(&bytes, 400, url)?;
-
-                if resp_json["captcha_sitekey"].is_string() {
-                    let captcha = serde_json::from_value::<CaptchaRequiredError>(resp_json)
-                        .map_err(|e| Box::new(e) as BoxedError)?;
-                    return Err(Box::new(captcha));
-                }
-
-                error!("Bad request to {}: {}", url, resp_json.to_string());
-                return Err("Bad request".into());
+                return Err(bad_request_error(&bytes, url));
             }
             code => {
                 let bytes = resp.bytes().await?;
