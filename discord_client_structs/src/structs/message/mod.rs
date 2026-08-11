@@ -37,6 +37,9 @@ pub struct Message {
     #[builder(default)]
     #[serde(skip_serializing)]
     pub id: u64,
+    #[builder(default)]
+    #[serde(default, skip_serializing)]
+    pub hit: bool,
     #[snowflake]
     #[builder(default)]
     #[serde(skip_serializing)]
@@ -238,6 +241,32 @@ pub struct MessageComponent {
     pub min_values: Option<u64>,
     pub max_values: Option<u64>,
     pub components: Option<Vec<MessageComponent>>,
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::Message;
+    use crate::structs::user::User;
+
+    #[test]
+    fn message_deserializes_search_hit_marker() {
+        let mut value = serde_json::to_value(Message::default()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.insert("id".to_string(), serde_json::json!("1"));
+        object.insert("channel_id".to_string(), serde_json::json!("2"));
+        object.insert(
+            "author".to_string(),
+            serde_json::to_value(User::default()).unwrap(),
+        );
+        object.insert("mention_everyone".to_string(), serde_json::json!(false));
+        object.insert("pinned".to_string(), serde_json::json!(false));
+        object.insert("flags".to_string(), serde_json::json!(0));
+        object.insert("hit".to_string(), serde_json::json!(true));
+
+        let message: Message = serde_json::from_value(value).unwrap();
+
+        assert!(message.hit);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, EnumFromPrimitive)]
