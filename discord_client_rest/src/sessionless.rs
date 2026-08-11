@@ -140,9 +140,8 @@ impl SessionlessClient {
             self.global_rate_limiter.wait_if_needed().await;
 
             let route_limiter = self.get_route_limiter(path).await;
-            route_limiter.wait_if_needed().await;
-
-            let _route_lock = route_limiter.route_mutex.lock().await;
+            let route_guard = route_limiter.lock_route().await;
+            self.global_rate_limiter.wait_if_needed().await;
 
             let result = self
                 .make_request(
@@ -153,8 +152,6 @@ impl SessionlessClient {
                     req_properties.clone(),
                 )
                 .await;
-
-            drop(_route_lock);
 
             match result {
                 Ok(response) => return Ok(response),
@@ -177,9 +174,10 @@ impl SessionlessClient {
                             rate_limit_error.retry_after.as_secs_f64()
                         );
                         continue;
-                    } else {
-                        return Err(e);
                     }
+
+                    drop(route_guard);
+                    return Err(e);
                 }
             }
         }
@@ -208,19 +206,15 @@ impl SessionlessClient {
         T: DeserializeOwned + Default,
         B: Serialize + Send + Sync,
     {
-        let mut full_url = format!("{}v{}/{}", API_BASE, self.api_version, path);
-        if let Some(query) = query {
-            let query_string = query
-                .iter()
-                .map(|(k, v)| format!("{}={}", k, v))
-                .collect::<Vec<String>>()
-                .join("&");
-            full_url.push_str(&format!("?{}", query_string));
-        }
+        let full_url = format!("{}v{}/{}", API_BASE, self.api_version, path);
         let mut request = self
             .client
             .request(method, &full_url)
             .headers(self.build_headers(req_properties).await?);
+
+        if let Some(query) = query {
+            request = request.query(&query);
+        }
 
         if let Some(body_data) = body {
             request = request

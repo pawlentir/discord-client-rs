@@ -59,6 +59,7 @@ use wreq::header::HeaderMap;
 use wreq::{Client, Method, Response};
 
 const API_BASE: &str = "https://discord.com/api/";
+const SEARCH_INDEXING_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Authentication {
@@ -116,6 +117,19 @@ fn search_indexing_retry_after(bytes: &[u8]) -> Duration {
     Duration::from_secs_f64(retry_after)
 }
 
+fn rate_limit_route(route: &str) -> &str {
+    let mut segments = route.split('/');
+    if matches!(segments.next(), Some("users"))
+        && segments.next().is_some()
+        && matches!(segments.next(), Some("profile"))
+        && segments.next().is_none()
+    {
+        "users/:user_id/profile"
+    } else {
+        route
+    }
+}
+
 pub struct RestClient {
     authorization: String,
     authentication: Authentication,
@@ -132,6 +146,10 @@ pub struct RestClient {
 }
 
 impl RestClient {
+    pub fn is_bot(&self) -> bool {
+        self.authentication == Authentication::Bot
+    }
+
     pub async fn connect(
         token: String,
         custom_api_version: Option<u8>,
@@ -520,13 +538,14 @@ impl RestClient {
         T: DeserializeOwned + Default + Send,
         B: Serialize + Send + Sync + Clone,
     {
+        let mut indexing_deadline = None;
+
         loop {
             self.global_rate_limiter.wait_if_needed().await;
 
             let route_limiter = self.get_route_limiter(path).await;
-            route_limiter.wait_if_needed().await;
-
-            let _route_lock = route_limiter.route_mutex.lock().await;
+            let route_guard = route_limiter.lock_route().await;
+            self.global_rate_limiter.wait_if_needed().await;
 
             let result = self
                 .make_request(
@@ -537,8 +556,6 @@ impl RestClient {
                     req_properties.clone(),
                 )
                 .await;
-
-            drop(_route_lock);
 
             match result {
                 Ok(response) => return Ok(response),
@@ -561,7 +578,31 @@ impl RestClient {
                             rate_limit_error.retry_after.as_secs_f64()
                         );
                         continue;
-                    } else if let Some(indexing_error) = e.downcast_ref::<SearchIndexingError>() {
+                    }
+
+                    drop(route_guard);
+                    if let Some(indexing_error) = e.downcast_ref::<SearchIndexingError>() {
+                        let deadline = *indexing_deadline.get_or_insert_with(|| {
+                            tokio::time::Instant::now() + SEARCH_INDEXING_TIMEOUT
+                        });
+                        let remaining =
+                            deadline.checked_duration_since(tokio::time::Instant::now());
+                        let Some(remaining) = remaining else {
+                            return Err(format!(
+                                "Message search indexing did not finish within {} seconds [{}]",
+                                SEARCH_INDEXING_TIMEOUT.as_secs(),
+                                path
+                            )
+                            .into());
+                        };
+                        if indexing_error.retry_after >= remaining {
+                            return Err(format!(
+                                "Message search indexing did not finish within {} seconds [{}]",
+                                SEARCH_INDEXING_TIMEOUT.as_secs(),
+                                path
+                            )
+                            .into());
+                        }
                         warn!(
                             "Messages are still being indexed [{}]! Retrying after {:.2} seconds",
                             path,
@@ -578,6 +619,7 @@ impl RestClient {
     }
 
     async fn get_route_limiter(&self, route: &str) -> RateLimiter {
+        let route = rate_limit_route(route);
         let mut limiters = self.route_rate_limiters.lock().await;
         if let Some(limiter) = limiters.get(route) {
             limiter.clone()
@@ -600,19 +642,15 @@ impl RestClient {
         T: DeserializeOwned + Default,
         B: Serialize + Send + Sync,
     {
-        let mut full_url = format!("{}v{}/{}", API_BASE, self.api_version, path);
-        if let Some(query) = query {
-            let query_string = query
-                .iter()
-                .map(|(k, v)| format!("{}={}", k, v))
-                .collect::<Vec<String>>()
-                .join("&");
-            full_url.push_str(&format!("?{}", query_string));
-        }
+        let full_url = format!("{}v{}/{}", API_BASE, self.api_version, path);
         let mut request = self
             .client
             .request(method, &full_url)
             .headers(self.build_headers(req_properties)?);
+
+        if let Some(query) = query {
+            request = request.query(&query);
+        }
 
         if let Some(body_data) = body {
             request = request
@@ -818,5 +856,91 @@ impl RequestProperties {
     pub fn with_solved_captcha(mut self, solved_captcha: SolvedCaptcha) -> Self {
         self.solved_captcha = Some(solved_captcha);
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Authentication, rate_limit_route, search_indexing_retry_after, should_retry_search_indexing,
+    };
+    use std::time::Duration;
+
+    #[test]
+    fn builds_bot_authorization() {
+        let token = Authentication::Bot
+            .normalize_token(" Bot token ".to_string())
+            .unwrap();
+
+        assert_eq!(token, "token");
+        assert_eq!(Authentication::Bot.authorization(&token), "Bot token");
+        assert!(
+            Authentication::Bot
+                .normalize_token(" ".to_string())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn preserves_user_authorization() {
+        let token = Authentication::User
+            .normalize_token(" user-token ".to_string())
+            .unwrap();
+
+        assert_eq!(token, " user-token ");
+        assert_eq!(Authentication::User.authorization(&token), " user-token ");
+    }
+
+    #[test]
+    fn reads_search_indexing_retry_after() {
+        assert_eq!(
+            search_indexing_retry_after(br#"{"retry_after":2.5}"#),
+            Duration::from_secs_f64(2.5)
+        );
+        assert_eq!(
+            search_indexing_retry_after(br#"{"retry_after":0}"#),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            search_indexing_retry_after(b"not json"),
+            Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn scopes_search_indexing_retries_to_bots_and_search_paths() {
+        assert!(should_retry_search_indexing(
+            Authentication::Bot,
+            202,
+            "guilds/1/messages/search"
+        ));
+        assert!(!should_retry_search_indexing(
+            Authentication::User,
+            202,
+            "guilds/1/messages/search"
+        ));
+        assert!(!should_retry_search_indexing(
+            Authentication::Bot,
+            200,
+            "guilds/1/messages/search"
+        ));
+        assert!(!should_retry_search_indexing(
+            Authentication::Bot,
+            202,
+            "channels/1/messages"
+        ));
+    }
+
+    #[test]
+    fn profile_requests_share_one_rate_limit_route() {
+        assert_eq!(
+            rate_limit_route("users/123/profile"),
+            "users/:user_id/profile"
+        );
+        assert_eq!(
+            rate_limit_route("users/456/profile"),
+            "users/:user_id/profile"
+        );
+        assert_eq!(rate_limit_route("users/123"), "users/123");
     }
 }
