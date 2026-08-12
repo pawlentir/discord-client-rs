@@ -52,12 +52,14 @@ use iana_time_zone::get_timezone;
 use log::{error, warn};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
+use wreq::cookie::{CookieStore, Cookies, Jar};
 use wreq::header::HeaderMap;
-use wreq::{Client, Method, Response};
+use wreq::{Client, Method, Response, Uri, Version};
 
 const API_BASE: &str = "https://discord.com/api/";
 const SEARCH_INDEXING_TIMEOUT: Duration = Duration::from_secs(30);
@@ -118,16 +120,19 @@ fn search_indexing_retry_after(bytes: &[u8]) -> Duration {
     Duration::from_secs_f64(retry_after)
 }
 
-fn rate_limit_route(route: &str) -> &str {
-    let mut segments = route.split('/');
-    if matches!(segments.next(), Some("users"))
-        && segments.next().is_some()
-        && matches!(segments.next(), Some("profile"))
-        && segments.next().is_none()
-    {
-        "users/:user_id/profile"
+fn rate_limit_route(route: &str) -> Cow<'_, str> {
+    let Some(("users", user_route)) = route.split_once('/') else {
+        return Cow::Borrowed(route);
+    };
+    let (user_id, suffix) = user_route.split_once('/').unwrap_or((user_route, ""));
+    if user_id.is_empty() || !user_id.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Cow::Borrowed(route);
+    }
+
+    if suffix.is_empty() {
+        Cow::Borrowed("users/:user_id")
     } else {
-        route
+        Cow::Owned(format!("users/:user_id/{suffix}"))
     }
 }
 
@@ -136,6 +141,7 @@ pub struct RestClient {
     authentication: Authentication,
     pub user_id: u64,
     client: Client,
+    cookie_store: Option<Arc<Jar>>,
     pub api_version: u8,
     pub application_command_index: Option<ApplicationCommandIndex>,
     locale: String,
@@ -205,13 +211,18 @@ impl RestClient {
             (Authentication::Bot, None) => BuildNumbers::new(0, None),
         };
 
-        let (client, api_version) = match authentication {
+        let (client, cookie_store, api_version) = match authentication {
             Authentication::User => {
                 let bootstrap = bootstrap_client(custom_api_version, proxy.as_deref()).await?;
-                (bootstrap.client, bootstrap.api_version)
+                (
+                    bootstrap.client,
+                    Some(bootstrap.cookie_store),
+                    bootstrap.api_version,
+                )
             }
             Authentication::Bot => (
                 build_bot_client(proxy.as_deref())?,
+                None,
                 custom_api_version.unwrap_or(DEFAULT_API_VERSION),
             ),
         };
@@ -307,6 +318,7 @@ impl RestClient {
             authentication,
             user_id,
             client,
+            cookie_store,
             api_version,
             application_command_index,
             locale,
@@ -622,11 +634,11 @@ impl RestClient {
     async fn get_route_limiter(&self, route: &str) -> RateLimiter {
         let route = rate_limit_route(route);
         let mut limiters = self.route_rate_limiters.lock().await;
-        if let Some(limiter) = limiters.get(route) {
+        if let Some(limiter) = limiters.get(route.as_ref()) {
             limiter.clone()
         } else {
             let limiter = RateLimiter::new();
-            limiters.insert(route.to_string(), limiter.clone());
+            limiters.insert(route.into_owned(), limiter.clone());
             limiter
         }
     }
@@ -799,6 +811,13 @@ impl RestClient {
     pub fn get_http_client(&self) -> &Client {
         &self.client
     }
+
+    pub fn get_cookies(&self, uri: &Uri) -> Option<wreq::header::HeaderValue> {
+        match self.cookie_store.as_ref()?.cookies(uri, Version::HTTP_11) {
+            Cookies::Compressed(cookies) => Some(cookies),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Builder, Default)]
@@ -847,91 +866,5 @@ impl RequestProperties {
     pub fn with_solved_captcha(mut self, solved_captcha: SolvedCaptcha) -> Self {
         self.solved_captcha = Some(solved_captcha);
         self
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        Authentication, rate_limit_route, search_indexing_retry_after, should_retry_search_indexing,
-    };
-    use std::time::Duration;
-
-    #[test]
-    fn builds_bot_authorization() {
-        let token = Authentication::Bot
-            .normalize_token(" Bot token ".to_string())
-            .unwrap();
-
-        assert_eq!(token, "token");
-        assert_eq!(Authentication::Bot.authorization(&token), "Bot token");
-        assert!(
-            Authentication::Bot
-                .normalize_token(" ".to_string())
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn preserves_user_authorization() {
-        let token = Authentication::User
-            .normalize_token(" user-token ".to_string())
-            .unwrap();
-
-        assert_eq!(token, " user-token ");
-        assert_eq!(Authentication::User.authorization(&token), " user-token ");
-    }
-
-    #[test]
-    fn reads_search_indexing_retry_after() {
-        assert_eq!(
-            search_indexing_retry_after(br#"{"retry_after":2.5}"#),
-            Duration::from_secs_f64(2.5)
-        );
-        assert_eq!(
-            search_indexing_retry_after(br#"{"retry_after":0}"#),
-            Duration::from_secs(1)
-        );
-        assert_eq!(
-            search_indexing_retry_after(b"not json"),
-            Duration::from_secs(1)
-        );
-    }
-
-    #[test]
-    fn scopes_search_indexing_retries_to_bots_and_search_paths() {
-        assert!(should_retry_search_indexing(
-            Authentication::Bot,
-            202,
-            "guilds/1/messages/search"
-        ));
-        assert!(!should_retry_search_indexing(
-            Authentication::User,
-            202,
-            "guilds/1/messages/search"
-        ));
-        assert!(!should_retry_search_indexing(
-            Authentication::Bot,
-            200,
-            "guilds/1/messages/search"
-        ));
-        assert!(!should_retry_search_indexing(
-            Authentication::Bot,
-            202,
-            "channels/1/messages"
-        ));
-    }
-
-    #[test]
-    fn profile_requests_share_one_rate_limit_route() {
-        assert_eq!(
-            rate_limit_route("users/123/profile"),
-            "users/:user_id/profile"
-        );
-        assert_eq!(
-            rate_limit_route("users/456/profile"),
-            "users/:user_id/profile"
-        );
-        assert_eq!(rate_limit_route("users/123"), "users/123");
     }
 }

@@ -57,6 +57,3 @@ pretty_env_logger = "0.5.0"
 derive_builder = "0.20.2"
 chrono.workspace = true
 rand = "0.9.4"
-
-[dev-dependencies]
-tokio = { workspace = true, features = ["test-util"] }

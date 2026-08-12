@@ -49,7 +49,7 @@ impl SessionlessClient {
             Some(build_num) => build_num,
         };
 
-        let http_client = build_emulated_client(proxy.as_deref())?;
+        let http_client = build_emulated_client(proxy.as_deref())?.client;
 
         let timezone = get_timezone().unwrap_or("America/New_York".to_string());
         let locale = current_locale().unwrap_or("en-US".to_string());

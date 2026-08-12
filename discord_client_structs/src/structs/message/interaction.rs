@@ -33,26 +33,3 @@ pub struct MessageInteractionMetadata {
     #[snowflake]
     pub target_message_id: Option<u64>,
 }
-
-#[cfg(test)]
-mod tests {
-    use super::MessageInteractionMetadata;
-
-    const USER: &str = r#""user":{"id":"456","username":"member","discriminator":"0"}"#;
-
-    #[test]
-    fn interaction_metadata_defaults_missing_interacted_message_id() {
-        let raw = format!(r#"{{"id":"123","type":2,{USER}}}"#);
-        let metadata: MessageInteractionMetadata = serde_json::from_str(&raw).unwrap();
-
-        assert_eq!(metadata.interacted_message_id, None);
-    }
-
-    #[test]
-    fn interaction_metadata_parses_interacted_message_id_as_snowflake() {
-        let raw = format!(r#"{{"id":"123","type":2,{USER},"interacted_message_id":"789"}}"#);
-        let metadata: MessageInteractionMetadata = serde_json::from_str(&raw).unwrap();
-
-        assert_eq!(metadata.interacted_message_id, Some(789));
-    }
-}

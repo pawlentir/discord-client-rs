@@ -22,6 +22,9 @@ use wreq::ws::message::Message;
 use wreq_util::{Emulation, Platform, Profile};
 use zlib_stream::{ZlibDecompressionError, ZlibStreamDecompressor};
 
+// Discord rejects member commands sent less than 500 ms apart; allow 150 ms of headroom.
+const MEMBER_LIST_COMMAND_INTERVAL: Duration = Duration::from_millis(650);
+
 pub type GuildMemberListRange = [u64; 2];
 pub type GuildChannelRanges = HashMap<u64, Vec<GuildMemberListRange>>;
 pub type GuildSubscriptions = HashMap<u64, GuildSubscription>;
@@ -529,15 +532,8 @@ impl GatewayClient {
         &mut self,
         subscriptions: GuildSubscriptions,
     ) -> BoxedResult<()> {
-        self.pace_member_list_command().await;
         let payload = create_op_37(&subscriptions);
-
-        self.tx
-            .lock()
-            .await
-            .send(Message::Text(payload.into()))
-            .await?;
-        Ok(())
+        self.send_member_list_command(payload).await
     }
 
     pub async fn update_voice_state(
@@ -628,6 +624,16 @@ impl GatewayClient {
         Ok(())
     }
 
+    async fn send_member_list_command(&mut self, payload: String) -> BoxedResult<()> {
+        if let Some(last_command) = self.member_list_command_at {
+            tokio::time::sleep_until(last_command + MEMBER_LIST_COMMAND_INTERVAL).await;
+        }
+
+        self.send_text(payload).await?;
+        self.member_list_command_at = Some(Instant::now());
+        Ok(())
+    }
+
     pub async fn update_lobby_voice_states(
         &mut self,
         lobby_id: u64,
@@ -710,16 +716,8 @@ impl GatewayClient {
         guild_id: u64,
         channel_id: u64,
     ) -> BoxedResult<()> {
-        self.pace_member_list_command().await;
-        self.send_text(create_op_39(guild_id, channel_id)).await
-    }
-
-    async fn pace_member_list_command(&mut self) {
-        const INTERVAL: Duration = Duration::from_millis(650);
-        if let Some(last_command) = self.member_list_command_at {
-            tokio::time::sleep_until(last_command + INTERVAL).await;
-        }
-        self.member_list_command_at = Some(Instant::now());
+        self.send_member_list_command(create_op_39(guild_id, channel_id))
+            .await
     }
 
     pub async fn update_time_spent_session_id(
@@ -781,15 +779,8 @@ impl GatewayClient {
         continuation_token: Option<u64>,
         nonce: Option<&str>,
     ) -> BoxedResult<()> {
-        self.pace_member_list_command().await;
         let payload = create_op_35(guild_id, query, continuation_token, nonce);
-
-        self.tx
-            .lock()
-            .await
-            .send(Message::Text(payload.into()))
-            .await?;
-        Ok(())
+        self.send_member_list_command(payload).await
     }
 
     pub async fn request_guild_members(
@@ -801,8 +792,6 @@ impl GatewayClient {
         user_ids: Option<Vec<u64>>,
         nonce: Option<&str>,
     ) -> BoxedResult<()> {
-        self.pace_member_list_command().await;
-
         if let Some(user_ids) = &user_ids {
             if user_ids.len() > 100 {
                 return Err("User IDs can't be more than 100".into());
@@ -810,13 +799,7 @@ impl GatewayClient {
         }
 
         let payload = create_op_8(guild_id, query, limit, presences, user_ids, nonce);
-
-        self.tx
-            .lock()
-            .await
-            .send(Message::Text(payload.into()))
-            .await?;
-        Ok(())
+        self.send_member_list_command(payload).await
     }
 
     pub async fn send_remote_command<T: serde::Serialize>(

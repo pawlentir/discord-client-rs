@@ -67,8 +67,6 @@ async fn main() {
                     let page_member_id = members_chunk
                         .members
                         .iter()
-                        // OP35 pages toward older joins, so the continuation is
-                        // the earliest joined member in the page.
                         .min_by_key(|member| member.joined_at)
                         .unwrap()
                         .clone()
